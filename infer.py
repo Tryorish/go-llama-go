@@ -53,7 +53,7 @@ if __name__ == "__main__":
     num_profiling_iterations = args.num_profiling_iterations
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-
+    tokenizer.pad_token = tokenizer.eos_token
     inputs = tokenizer(prompts, padding=True, return_tensors="pt").to(device)
 
     model = llama.ModelForCausalLM.from_pretrained(model_path).to(device)

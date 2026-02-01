@@ -7,6 +7,9 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file
 
+import triton
+import triton.language as tl
+
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -30,6 +33,25 @@ class ModelConfig:
 
     vocab_size: int
 
+@triton.jit
+def rmsnorm_kernel(
+    x_ptr, y_ptr, w_ptr,
+    stride_M,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr
+):
+    row = tl.program_id(0)
+    x_ptr += row * stride_M
+    y_ptr += row * stride_M
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    sq_sum = tl.sum(x * x)
+    inv_rms = tl.rsqrt(sq_sum / N + eps)
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    y = x * inv_rms * w
+    tl.store(y_ptr + cols, y, mask=mask)
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps):
@@ -40,11 +62,24 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, input):
-        return (
-            input
-            * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-            * self.weight
-        )
+        # return (
+        #     input
+        #     * torch.rsqrt(input.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        #     * self.weight
+        # )
+        x = input.view(-1, input.shape[-1])
+        M, N = x.shape
+        y = torch.empty_like(x)
+        # 64KB 是 Triton 单个 program 能处理的一行数据规模上限的经验安全值。
+        MAX_FUSED_SIZE = 65536 // input.element_size()
+        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
+        if N > BLOCK_SIZE:
+            raise RuntimeError("This rms norm doesn't support feature dim >= 64KB.")
+        num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+        rmsnorm_kernel[(M,)](x, y, self.weight, 
+                             x.stride(0), N, self.eps, 
+                             BLOCK_SIZE=BLOCK_SIZE, num_warps=num_warps)
+        return y.view_as(input)
 
 
 class MLP(nn.Module):
